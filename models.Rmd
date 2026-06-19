@@ -1,0 +1,713 @@
+---
+title: "models"
+output: html_document
+---
+
+# Connection
+
+```{r conn, include=FALSE}
+# Connect to database
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(car)
+library(glmnet)
+library(caret)
+library(rpart)
+library(reshape2)
+library(knitr)
+library(randomForest)
+library(gbm)
+library(mgcv)
+library(kableExtra)
+library(webshot2)
+library(flextable)
+library(gdtools)
+library(piecewiseSEM)
+library(fastshap)
+library(shapviz)
+library(ranger)
+library(pdp)
+library(Hmisc)
+
+setwd("C:/Users/kelto/GT_Analytics/Spring_2026/Data_Mining/ISYE7406_GITHUB_REPO")
+con <- dbConnect(SQLite(), "NLA.db")
+
+df <- dbReadTable(con, "rel_vars")
+```
+
+# Feature Engineering
+
+```{r engineer}
+## clay = 1 - sand - silt
+df$calc_clay <- 1 - (df$BSFCSAND + df$BSFCSILT)
+hist(df$calc_clay)
+hist(df$BSFCSAND + df$BSFCSILT)
+
+# log transform
+## chlorophyll a
+hist(df$CHLA_RESULT)
+df$log_chla <- log10(df$CHLA_RESULT)
+hist(df$log_chla)
+
+## nitrogen
+hist(df$NTL_RESULT)
+df$log_N <- log10(df$NTL_RESULT)
+hist(df$log_N)
+
+## phosphorus
+hist(df$PTL_RESULT)
+df$log_P <- log10(df$PTL_RESULT)
+hist(df$log_P)
+
+## herb bio
+hist(df$HERB_BIO)
+df$log_herb_bio <- log10(df$HERB_BIO+1)
+hist(df$log_herb_bio)
+
+## omni bio
+hist(df$OMNI_BIO)
+df$log_omni_bio <- log10(df$OMNI_BIO+1)
+hist(df$log_omni_bio)
+
+## pred bio
+hist(df$PRED_BIO)
+df$log_pred_bio <- log10(df$PRED_BIO+1)
+hist(df$log_pred_bio)
+
+## benthic filterers
+hist(df$COFIPIND)
+df$log_ben_filt <- log10(df$COFIPIND+1)
+hist(df$log_ben_filt)
+
+## benthic gatherers
+hist(df$COGAPIND)
+df$log_ben_gath <- log10(df$COGAPIND+1)
+hist(df$log_ben_gath)
+
+## benthic predators
+hist(df$PREDPIND)
+df$log_ben_pred <- log10(df$PREDPIND+1)
+hist(df$log_ben_pred)
+
+## benthic shredders
+hist(df$SHRDPIND)
+df$log_ben_shrd <- log10(df$SHRDPIND+1)
+hist(df$log_ben_shrd)
+
+## benthic scrapers
+hist(df$SCRPPIND)
+df$log_ben_scrp <- log10(df$SCRPPIND+1)
+hist(df$log_ben_scrp)
+
+```
+
+# Feature Selection
+
+```{r select}
+all_vars <- df %>% 
+  subset(select = c(log_turb, # L0
+    calc_clay, RVFPCANDECIDUOUS_RIP, log_chla, AMITOTAL, # L1
+    log_N, log_P, TEMPERATURE, log_herb_bio, log_omni_bio, log_pred_bio, log_ben_filt, log_ben_gath, log_ben_pred, log_ben_shrd, log_ben_scrp, Accipitriformes_nspecies, Anseriformes_nspecies, Coraciiformes_nspecies, Pelecaniformes_nspecies # L2
+    ))
+```
+
+# Nans
+
+```{r nans}
+# remove chunk of nans
+all_vars <- all_vars %>% filter(!is.na(calc_clay))
+boxplot(colSums(is.na(all_vars)), horizontal = TRUE, xlab="# NAs per feature", main="NAs remaining")
+
+# omit all nas
+print(paste("Nrows in dataset with all NAs omitted:", nrow(na.omit(all_vars))))
+
+all_vars <- na.omit(all_vars)
+```
+
+# Multicollinearity
+And outliers?
+
+```{r corr}
+## **AI generated figure**
+
+# compute correlations & p-values
+cor_res <- rcorr(as.matrix(all_vars))  # replace df with your data
+r <- cor_res$r
+p <- cor_res$P
+
+# lower triangle only
+r[upper.tri(r, diag = TRUE)] <- NA
+p[upper.tri(p, diag = TRUE)] <- NA
+
+melted <- merge(
+  reshape2::melt(r, na.rm = TRUE, value.name = "r"),
+  reshape2::melt(p, na.rm = TRUE, value.name = "p")
+)
+
+# significance stars
+melted$label <- paste0(
+  sprintf("%.2f", melted$r),
+  ifelse(melted$p < .001, "***", ifelse(melted$p < .01, "**", ifelse(melted$p < .05, "*", "")))
+)
+
+p <- ggplot(melted, aes(Var2, Var1, fill = r)) +
+  geom_tile(color = "white") +
+  # geom_text(aes(label = label), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
+                       limits = c(-1, 1), name = "r") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(x = NULL, y = NULL)
+
+ggsave("figures/corrplot.png", plot = p)
+```
+
+
+```{r multi}
+# VIF
+vif_lm_turb <- lm(log_turb~.,data = all_vars %>% subset(select=c(log_chla, calc_clay, RVFPCANDECIDUOUS_RIP, log_turb)))
+v <- vif(vif_lm_turb)
+print(sort(v, decreasing = TRUE))
+
+vif_lm_chla <- lm(log_chla~.,data = all_vars %>% subset(select=c(log_chla, log_N, log_P, TEMPERATURE, log_herb_bio, log_omni_bio, log_pred_bio, log_ben_filt, log_ben_gath, log_ben_pred, log_ben_shrd, log_ben_scrp, Accipitriformes_nspecies, Anseriformes_nspecies, Coraciiformes_nspecies, Pelecaniformes_nspecies)))
+v <- vif(vif_lm_chla)
+print(sort(v, decreasing = TRUE))
+
+vif_lm_algae <- lm(AMITOTAL~.,data = all_vars %>% subset(select=c(AMITOTAL, log_N, log_P, TEMPERATURE, log_herb_bio, log_omni_bio, log_pred_bio, log_ben_filt, log_ben_gath, log_ben_pred, log_ben_shrd, log_ben_scrp, Accipitriformes_nspecies, Anseriformes_nspecies, Coraciiformes_nspecies, Pelecaniformes_nspecies)))
+v <- vif(vif_lm_algae)
+print(sort(v, decreasing = TRUE))
+```
+
+# Model Definitions
+
+```{r formulas}
+# formulas
+m1 <- as.formula("log_turb~calc_clay+RVFPCANDECIDUOUS_RIP+log_chla")
+m2 <- as.formula("log_chla~log_N+log_P+TEMPERATURE+log_herb_bio+log_omni_bio+log_pred_bio+log_ben_filt+log_ben_gath+log_ben_pred+log_ben_shrd+log_ben_scrp+Accipitriformes_nspecies+Anseriformes_nspecies+Coraciiformes_nspecies+Pelecaniformes_nspecies")
+m3 <- as.formula("AMITOTAL~log_N+log_P+TEMPERATURE+log_herb_bio+log_omni_bio+log_pred_bio+log_ben_filt+log_ben_gath+log_ben_pred+log_ben_shrd+log_ben_scrp+Accipitriformes_nspecies+Anseriformes_nspecies+Coraciiformes_nspecies+Pelecaniformes_nspecies")
+```
+
+
+# Cross Validation
+
+We want to compare confidence intervals for model performance (R2) and feature importance between the random forest and piecewise SEM models. We will do this with 100 rounds of Monte Carlo CV with p = 0.8.
+
+```{r cv}
+t0 <- Sys.time()
+
+# setup
+B <- 100
+N <- nrow(all_vars)
+p <- 0.8
+S <- round(p*N)
+rf1 <- vector("list", B)
+rf2 <- vector("list", B)
+rf3 <- vector("list", B)
+sem0 <- vector("list", B)
+set.seed(10)
+
+# pred grid
+all_vars_std <- as.data.frame(scale(all_vars))
+col_max <- apply(all_vars_std, 2, max)
+col_min <- apply(all_vars_std, 2, min)
+col_seqs <- Map(function(mn, mx) seq(mn, mx, length.out = 20), col_min, col_max)
+
+# functions
+fit_ranger <- function(f, d) {
+  return(ranger(f, data = d, importance = "permutation"))
+}
+
+pred_ranger <- function(object, newdata) {
+  return(predict(object, data = newdata)$predictions)
+}
+
+calc_r2 <- function(pred, test_vals, train_vals) {
+  ssres <- sum((test_vals - pred)^2)
+  sstot <- sum((test_vals - mean(train_vals))^2)
+  return(1 - (ssres/sstot))
+}
+
+calc_partials <- function(m, pvars, pfun, d) {
+  pdps <- vector("list", length(pvars))
+  for (v in seq(length(pvars))) {
+    v_grid <- data.frame(col_seqs[[pvars[v]]])
+    colnames(v_grid) <- pvars[v]
+    pdps[[v]] <- list(
+      Var = pvars[v],
+      PDP = partial(m, train = d, pred.var = c(pvars[v]), pred.fun = pfun, pred.grid = v_grid, type = "regression", plot = FALSE, chull = TRUE)
+    )
+  }
+  return(pdps)
+}
+
+# MC CV loop
+for (i in seq(B)) {
+  l0 <- Sys.time()
+  
+  # split
+  mask <- sample(1:N, S)
+  train <- all_vars[mask,]
+  test <- all_vars[-mask,]
+  
+  # standardize
+  train_means <- colMeans(train)
+  train_sds <- apply(train, 2, sd)
+  train_std <- as.data.frame(scale(train, center = train_means, scale = train_sds))
+  test_std <- as.data.frame(scale(test, center = train_means, scale = train_sds))
+  
+  # forest
+  ## L1
+  rf <- fit_ranger(m1, train_std)
+  pred <- pred_ranger(rf, test_std)
+  r2 <- calc_r2(pred, test_std$log_turb, train_std$log_turb)
+  pdps <- calc_partials(rf, labels(terms(m1)), pred_ranger, train_std)
+  
+  rf1[[i]] <- list(
+    R2 = r2,
+    imp = rf$variable.importance,
+    pdp = pdps
+  )
+  
+  ## L2
+  rf <- fit_ranger(m2, train_std)
+  pred <- pred_ranger(rf, test_std)
+  r2 <- calc_r2(pred, test_std$log_chla, train_std$log_chla)
+  pdps <- calc_partials(rf, labels(terms(m2)), pred_ranger, train_std)
+
+  rf2[[i]] <- list(
+    R2 = r2,
+    imp = rf$variable.importance,
+    pdp = pdps
+  )
+
+  ## L3
+  rf <- fit_ranger(m3, train_std)
+  pred <- pred_ranger(rf, test_std)
+  r2 <- calc_r2(pred, test_std$AMITOTAL, train_std$AMITOTAL)
+  pdps <- calc_partials(rf, labels(terms(m3)), pred_ranger, train_std)
+
+  rf3[[i]] <- list(
+    R2 = r2,
+    imp = rf$variable.importance,
+    pdp = pdps
+  )
+  
+  # pSEM
+  lm1 <- lm(m1, data = train_std)
+  lm2 <- lm(m2, data = train_std)
+  lm3 <- lm(m3, data = train_std)
+
+  s0 <- psem(lm1, lm2, lm3, log_chla %~~% AMITOTAL, data = train_std)
+  
+  ## L1
+  pred <- predict(lm1, newdata = test_std)
+  r2_1 <- calc_r2(pred, test_std$log_turb, train_std$log_turb)
+
+  ## L2
+  pred <- predict(lm2, newdata = test_std)
+  r2_2 <- calc_r2(pred, test_std$log_chla, train_std$log_chla)
+
+  ## L3
+  pred <- predict(lm3, newdata = test_std)
+  r2_3 <- calc_r2(pred, test_std$AMITOTAL, train_std$AMITOTAL)
+
+  sem0[[i]] <- list(
+    R2 = list(R2_1 = r2_1, R2_2 = r2_2, R2_3 = r2_3),
+    imp = summary(s0, .progressBar = FALSE)$coefficients
+  )
+  
+  l1 <- Sys.time()
+  print(paste("MC CV loop time:", round(l1-l0, 4), ", B:", i))
+
+}
+
+t1 <- Sys.time()
+print(paste("Execution time:", round(t1-t0, 4), ", Total MC CV rounds:", B))
+```
+
+# Model Comparison
+Perform Wilcoxon signed-rank and t-tests on R2 for each model
+
+```{r model comp}
+r2_rf <- data.frame(
+  M1 = numeric(0),
+  M2 = numeric(0),
+  M3 = numeric(0)
+)
+
+r2_sem <- data.frame(
+  M1 = numeric(0),
+  M2 = numeric(0),
+  M3 = numeric(0)
+)
+
+# forest
+for (i in seq(B)) {
+  r2_1 <- rf1[[i]]$R2
+  r2_2 <- rf2[[i]]$R2
+  r2_3 <- rf3[[i]]$R2
+  temp <- data.frame(M1 = r2_1, M2 = r2_2, M3 = r2_3)
+  r2_rf <- rbind(r2_rf, temp)
+}
+
+# psem
+for (i in seq(B)) {
+  r2_1 <- sem0[[i]]$R2$R2_1
+  r2_2 <- sem0[[i]]$R2$R2_2
+  r2_3 <- sem0[[i]]$R2$R2_3
+  temp <- data.frame(M1 = r2_1, M2 = r2_2, M3 = r2_3)
+  r2_sem <- rbind(r2_sem, temp)  
+}
+
+# wilcoxon signed-rank test
+## L1
+hist(r2_rf$M1 - r2_sem$M1)
+wt1 <- wilcox.test(r2_rf$M1, r2_sem$M1, paired = TRUE, alternative = "two.sided")
+print(wt1)
+
+## L2
+hist(r2_rf$M2 - r2_sem$M2)
+wt2 <- wilcox.test(r2_rf$M2, r2_sem$M2, paired = TRUE, alternative = "two.sided")
+print(wt2)
+
+## L3
+hist(r2_rf$M3 - r2_sem$M3)
+wt3 <- wilcox.test(r2_rf$M3, r2_sem$M3, paired = TRUE, alternative = "two.sided")
+print(wt3)
+
+
+# t-test
+## L1
+tt1 <- t.test(r2_rf$M1, r2_sem$M1, paired = TRUE, alternative = "two.sided")
+print(tt1)
+
+## L2
+tt2 <- t.test(r2_rf$M2, r2_sem$M2, paired = TRUE, alternative = "two.sided")
+print(tt2)
+
+## L3
+tt3 <- t.test(r2_rf$M3, r2_sem$M3, paired = TRUE, alternative = "two.sided")
+print(tt3)
+
+```
+
+## Combine and plot R2
+
+```{r r2}
+# pivot and combine
+r2_rf <- r2_rf %>% pivot_longer(cols = c(M1, M2, M3), names_to = "level", values_to = "value")
+r2_rf$Model <- "RandomForest"
+
+r2_sem <- r2_sem %>% pivot_longer(cols = c(M1, M2, M3), names_to = "level", values_to = "value")
+r2_sem$Model <- "PiecewiseSEM"
+
+r2_all <- rbind(r2_rf, r2_sem)
+r2_all <- r2_all %>% group_by(Model, level) %>% 
+  summarise(
+    est = mean(value),
+    se = sd(value) / sqrt(n()),
+    t = qt(0.975, df = n() - 1),
+    hi = est + t * se,
+    lo = est - t * se
+  )
+r2_all$labels <- if_else(r2_all$level=="M1", "log(Turbidity)",
+                         if_else(r2_all$level=="M2", "log(Chl-a)", "Macroalgae"))
+r2_all$labels <- factor(r2_all$labels, levels = c("Macroalgae","log(Chl-a)","log(Turbidity)"))
+
+# plot
+w <- 0.5
+p <- ggplot(r2_all, aes(x = labels, y = est, color = Model)) +
+  geom_point(position = position_dodge(width = w)) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = w, position = position_dodge(width = w)) +
+  ylim(0,1) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    y = "R-squared",
+    x = ""
+  )
+ggsave("figures/r2_plot.png", plot = p, width = 5, height = 3, units = "in")
+```
+
+# Feature Importance
+
+```{r feats}
+library(data.table)
+
+feats_rf <- vector("list", B*(3+15+15))
+pdps <- vector("list", B*(3+15+15))
+psem_0 <- vector("list", B)
+
+k <- 0L
+for (i in seq(B)) {
+  # forest
+  ## L1
+  vs <- names(rf1[[i]]$imp)
+  for (j in seq_along(vs)) {
+    k <- k + 1L
+    feats_rf[[k]] <- data.table(
+      Response = "log_turb",
+      Model = "forest",
+      Variable = vs[j],
+      Importance = rf1[[i]]$imp[[vs[j]]]
+    )
+
+    pdps[[k]] <- data.table(
+      Response = "log_turb",
+      Ind.Var = rf1[[i]]$pdp[[j]]$Var,
+      Value = rf1[[i]]$pdp[[j]]$PDP[[1]],
+      yhat = rf1[[i]]$pdp[[j]]$PDP$yhat
+    )
+  }
+  
+  ## L2
+  vs <- names(rf2[[i]]$imp)
+  for (j in seq_along(vs)) {
+    k <- k + 1L
+    feats_rf[[k]] <- data.table(
+      Response = "log_chla",
+      Model = "forest",
+      Variable = vs[j],
+      Importance = rf2[[i]]$imp[[vs[j]]]
+    )
+
+    pdps[[k]] <- data.table(
+      Response = "log_chla",
+      Ind.Var = rf2[[i]]$pdp[[j]]$Var,
+      Value = rf2[[i]]$pdp[[j]]$PDP[[1]],
+      yhat = rf2[[i]]$pdp[[j]]$PDP$yhat
+    )
+  }
+  
+  ## L3
+  vs <- names(rf3[[i]]$imp)
+  for (j in seq_along(vs)) {
+    k <- k + 1L
+    feats_rf[[k]] <- data.table(
+      Response = "AMITOTAL",
+      Model = "forest",
+      Variable = vs[j],
+      Importance = rf3[[i]]$imp[[vs[j]]]
+    )
+
+    pdps[[k]] <- data.table(
+      Response = "AMITOTAL",
+      Ind.Var = rf3[[i]]$pdp[[j]]$Var,
+      Value = rf3[[i]]$pdp[[j]]$PDP[[1]],
+      yhat = rf3[[i]]$pdp[[j]]$PDP$yhat
+    )
+  }
+  
+  # pSEM
+  psem_0[[i]] <- data.table(
+    Response = sem0[[i]]$imp[["Response"]], 
+    Model = "pSEM", 
+    Variable = sem0[[i]]$imp[["Predictor"]],
+    Importance = sem0[[i]]$imp[["Std.Estimate"]]
+  )
+}
+
+# aggregate
+pdps <- rbindlist(pdps)
+
+feats <- rbindlist(c(psem_0, feats_rf))
+
+agg_feats <- feats[
+  , .(
+    mean = mean(Importance),
+    se = sd(Importance) / sqrt(.N),
+    n = .N,
+    q_lower = quantile(Importance, 0.025),
+    q_upper = quantile(Importance, 0.975)
+  ),
+  by = .(Model, Response, Variable)
+][,
+  `:=`(
+    lower_ci = mean - qt(0.975, df = n - 1) * se,
+    upper_ci = mean + qt(0.975, df = n - 1) * se
+  )
+]
+
+agg_pdps <- pdps[
+  , .(
+    yhat.mean = mean(yhat),
+    lo95 = quantile(yhat, 0.025),
+    hi95 = quantile(yhat, 0.975),
+    lo50 = quantile(yhat, 0.25),
+    hi50 = quantile(yhat, 0.75)
+  ),
+  by = .(Response, Ind.Var, Value)
+]
+
+# write.csv(agg_feats, paste0(getwd(),"/Data/agg_feats.csv"), row.names = FALSE)
+# write.csv(agg_pdps, paste0(getwd(),"/Data/agg_pdps.csv"), row.names = FALSE)
+
+```
+
+## Compare features
+
+```{r feats plot}
+# sort
+sort_feats <- agg_feats
+sort_feats <- sort_feats %>% filter(Response != "~~log_chla")
+
+sort_feats$Response <- factor(sort_feats$Response, levels = c("log_turb","log_chla","AMITOTAL"))
+sort_feats$Model <- factor(sort_feats$Model, levels = c("forest","pSEM"))
+
+order_df <- sort_feats[sort_feats$Model == "forest" & sort_feats$Response != "AMITOTAL",]
+ordered_levels <- order_df$Variable[order(abs(order_df$mean))]
+sort_feats$Variable <- factor(sort_feats$Variable, levels = ordered_levels)
+
+# plot
+p <- ggplot(sort_feats %>% filter(Response != "~~log_chla"), 
+       aes(x = Variable, y = mean, color = Model)) +
+  geom_hline(yintercept = 0, color = "black") +
+  geom_pointrange(aes(ymin = q_lower, ymax = q_upper)) +
+  facet_grid(Response ~ Model, scales = "free") +
+  coord_flip() +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 1)) +
+  labs(
+    y = "",
+    x = ""
+  )
+ggsave("figures/importance_comp.png", plot = p, width = 7, height = 9, units = "in")
+```
+
+## Partial Dependence
+https://rpubs.com/vishal1310/QuickIntroductiontoPartialDependencePlots
+
+"If I fix feature X at value x and average predictions over the observed distribution of all other features, what is the predicted response?" It's a marginal effect — a single curve that summarizes the population-average relationship between one feature and the outcome.
+PDPs aggregate more naturally since they produce a curve (feature value → prediction) rather than per-observation values. You can average curves across iterations directly if you evaluate them on a common grid
+
+For your specific goals, quantile bands are more informative and appropriate. Here's why:
+You're not trying to quantify uncertainty in a population parameter — you're trying to assess whether the feature's learned relationship is stable across different lake subsets. A narrow quantile band means the RF consistently learns the same shape regardless of which lakes it trains on. A wide band means the relationship is sensitive to which lakes are included — ecologically meaningful information that a CI around the mean would obscure.
+A CI around the mean would shrink toward zero as you run more iterations, eventually showing an implausibly tight band that suggests false precision — it conflates iteration count with ecological certainty.
+
+Sparse data at that feature value. The most common explanation. If only a few lakes have TP values in a certain range, the RF has few training examples there and can produce unstable, spiky predictions. The rug plot will show this — a peak in a sparse region is almost certainly a data artifact.
+
+A PDP estimates the marginal effect of one feature on the predicted outcome by integrating out (averaging over) all other features. The core idea is to ask: if we could vary feature X across its range while holding the joint distribution of all other features fixed at their observed values, what would the model predict on average?
+
+```{r}
+# get top feats
+top_turb <- c("log_chla","calc_clay","RVFPCANDECIDUOUS_RIP")
+top_chla <- agg_feats %>% filter(Response=="log_chla", Model=="forest") %>% arrange(desc(mean)) %>% head(5) %>% select(Variable) %>% as.list()
+top_macro <- agg_feats %>% filter(Response=="AMITOTAL", Model=="forest") %>% arrange(desc(mean)) %>% head(5) %>% select(Variable) %>% as.list()
+
+# filter pdps
+turb_pdps <- agg_pdps %>% filter(Response=="log_turb", Ind.Var %in% top_turb)
+turb_pdps$Ind.Var <- factor(turb_pdps$Ind.Var, levels = top_turb)
+
+chla_pdps <- agg_pdps %>% filter(Response=="log_chla", Ind.Var %in% top_chla$Variable)
+chla_pdps$Ind.Var <- factor(chla_pdps$Ind.Var, levels = top_chla$Variable)
+
+macro_pdps <- agg_pdps %>% filter(Response=="AMITOTAL", Ind.Var %in% top_macro$Variable)
+macro_pdps$Ind.Var <- factor(macro_pdps$Ind.Var, levels = top_macro$Variable)
+
+# plots
+p <- ggplot(turb_pdps, aes(x=Value, y=yhat.mean)) +
+  geom_ribbon(aes(ymin=lo95, ymax=hi95), alpha=0.2, fill="blue") +
+  geom_ribbon(aes(ymin=lo50, ymax=hi50), alpha=0.4, fill="green") +
+  geom_line(linewidth = 1, color = "black") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~Ind.Var, scales="free_x") +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 1)) +
+  labs(
+    x = "",
+    y = "Partial Dependence",
+    title = "log(Turbidity) PDPs"
+  )
+ggsave("figures/pdp_turb.png", plot = p, width = 6, height = 3, units = "in")
+
+p <- ggplot(chla_pdps, aes(x=Value, y=yhat.mean)) +
+  geom_ribbon(aes(ymin=lo95, ymax=hi95), alpha=0.2, fill="blue") +
+  geom_ribbon(aes(ymin=lo50, ymax=hi50), alpha=0.4, fill="green") +
+  geom_line(linewidth = 1, color = "black") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~Ind.Var, scales="free_x", nrow = 1) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 1)) +
+  labs(
+    x = "",
+    y = "Partial Dependence",
+    title = "log(Chlorophyll-a) PDPs"
+  )
+ggsave("figures/pdp_chla.png", plot = p, width = 6, height = 3, units = "in")
+
+p <- ggplot(macro_pdps, aes(x=Value, y=yhat.mean)) +
+  geom_ribbon(aes(ymin=lo95, ymax=hi95), alpha=0.2, fill="blue") +
+  geom_ribbon(aes(ymin=lo50, ymax=hi50), alpha=0.4, fill="green") +
+  geom_line(linewidth = 1, color = "black") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~Ind.Var, scales="free_x", nrow = 1) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 1)) +
+  labs(
+    x = "",
+    y = "Partial Dependence",
+    title = "Macroalgae Index PDPs"
+  )
+ggsave("figures/pdp_macro.png", plot = p, width = 6, height = 3, units = "in")
+```
+
+## SHAP
+https://cran.r-project.org/web/packages/fastshap/vignettes/fastshap.html
+Libraries: shapviz, fastshap
+
+"For this specific observation, how much did each feature push the prediction up or down relative to the baseline (average prediction)?" It's a local, additive decomposition of each individual prediction into per-feature contributions.
+
+```{r shap}
+rf.full.1 <- ranger(m1, data = all_vars, num.trees = 500, importance = "permutation")
+ind.vars.1 <- labels(terms(m1))
+ex <- explain(rf.full.1, X = all_vars[,ind.vars.1], pred_wrapper = pred_ranger, nsim = 10, adjust = TRUE, shap_only = TRUE)
+shp <- shapviz(ex, X = all_vars[,ind.vars.1])
+
+sv_waterfall(shp, row_id = seq(N))
+sv_dependence2D(shp, x = "log_chla", y = "calc_clay")
+sv_importance(shp, kind = "both")
+sv_dependence(shp, v = c("log_chla", "calc_clay"), color_var = NULL, share_y = TRUE)
+
+shp.int <- data.frame(
+  chl = shp$X$log_chla,
+  clay = shp$X$calc_clay,
+  SHAP = shp$S[,"log_chla"] + shp$S[,"calc_clay"]
+)
+
+ggplot(shp.int, aes(x=chl, y=clay, z=SHAP)) +
+  stat_summary_hex(fun = mean) +
+  scale_fill_gradient2(midpoint = 0)
+
+ggplot(shp.int, aes(x=chl, y=clay, color=SHAP)) +
+  geom_point(alpha=0.8, size=3) +
+  scale_color_gradient2(midpoint = 0, low = "paleturquoise", high = "seagreen", mid = "turquoise")
+
+ggplot(shp.int, aes(x=chl, y=clay)) +
+  stat_density2d_filled(aes(fill = after_stat(level)), alpha=0.8) +
+  # geom_point(aes(color=SHAP), size=1) +
+  scale_color_gradient2(midpoint = 0)
+```
+
+## Full pSEM
+
+```{r full psem}
+# pSEM
+all_vars_std <- as.data.frame(scale(all_vars, center = TRUE, scale = TRUE))
+
+lm1 <- lm(m1, data = all_vars_std)
+lm2 <- lm(m2, data = all_vars_std)
+lm3 <- lm(m3, data = all_vars_std)
+
+s0 <- psem(lm1, lm2, lm3, log_chla %~~% AMITOTAL, data = all_vars_std)
+sum0 <- summary(s0, .progressBar = FALSE)
+imp <- sum0$coefficients
+
+plot(s0)
+plot(all_vars_std$log_chla, all_vars_std$log_turb)
+```
+
